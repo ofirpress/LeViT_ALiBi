@@ -5,6 +5,7 @@
 # https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
 # Copyright 2020 Ross Wightman, Apache-2.0 License
 
+import math
 import torch
 import itertools
 import utils
@@ -207,17 +208,32 @@ class Attention(torch.nn.Module):
         points = list(itertools.product(range(resolution), range(resolution)))
         N = len(points)
         attention_offsets = {}
+        
+
+        def get_slopes(n):
+            def get_slopes_power_of_2(n):
+                start = (2**(-2**-(math.log2(n)-3)))
+                ratio = start
+                return [start*ratio**i for i in range(n)]
+
+            if math.log2(n).is_integer():
+                return get_slopes_power_of_2(n)                   #In the paper, we only train models that have 2^a heads for some a. This function has
+            else:                                                 #some good properties that only occur when the input is a power of 2. To maintain that even
+                closest_power_of_2 = 2**math.floor(math.log2(n))  #when the number of heads is not a power of 2, we use this workaround.
+                return get_slopes_power_of_2(closest_power_of_2) + get_slopes(2*closest_power_of_2)[0::2][:n-closest_power_of_2] 
+        
+        slopes = torch.Tensor(get_slopes(num_heads)).unsqueeze(1)
         idxs = []
         for p1 in points:
             for p2 in points:
-                offset = (abs(p1[0] - p2[0]), abs(p1[1] - p2[1]))
-                if offset not in attention_offsets:
-                    attention_offsets[offset] = len(attention_offsets)
-                idxs.append(attention_offsets[offset])
-        self.attention_biases = torch.nn.Parameter(
-            torch.zeros(num_heads, len(attention_offsets)))
-        self.register_buffer('attention_bias_idxs',
-                             torch.LongTensor(idxs).view(N, N))
+                dist = math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+                idxs.append(dist*slopes)
+#        print(idxs[0].shape, 'a')
+        all_bias = torch.cat(idxs, dim=1)
+#        print(all_bias.shape)
+        all_bias = all_bias.view(num_heads, N, N)
+
+        self.register_buffer('alibi_b', all_bias)
 
         global FLOPS_COUNTER
         #queries * keys
@@ -230,10 +246,10 @@ class Attention(torch.nn.Module):
     @torch.no_grad()
     def train(self, mode=True):
         super().train(mode)
-        if mode and hasattr(self, 'ab'):
-            del self.ab
-        else:
-            self.ab = self.attention_biases[:, self.attention_bias_idxs]
+        #if mode and hasattr(self, 'ab'):
+        #    del self.ab
+        #else:
+        #    self.ab = self.attention_biases[:, self.attention_bias_idxs]
 
     def forward(self, x):  # x (B,N,C)
         B, N, C = x.shape
@@ -246,9 +262,9 @@ class Attention(torch.nn.Module):
 
         attn = (
             (q @ k.transpose(-2, -1)) * self.scale
-            +
-            (self.attention_biases[:, self.attention_bias_idxs]
-             if self.training else self.ab)
+            + self.alibi_b
+            #(self.attention_biases[:, self.attention_bias_idxs]
+            # if self.training else self.ab)
         )
         attn = attn.softmax(dim=-1)
         x = (attn @ v).transpose(1, 2).reshape(B, N, self.dh)
